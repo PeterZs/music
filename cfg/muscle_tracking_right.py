@@ -9,7 +9,7 @@ env_params = dict(
     episode_length = 480*3,
     frameskip = 1,
     control_freq = 8,
-    character_model = "assets/right_hand.xml",
+    character_model = "assets/right_hand_muscle_driven.xml",
     motion_file = [os.path.join("motions/right_hand_motions", _) for _ in os.listdir("motions/right_hand_motions")],
 
     random_init=True,
@@ -59,6 +59,15 @@ training_params = dict(
     horizon = 32,
     num_envs = 8192,
     terminate_reward = 0
+)
+
+model_params = dict(
+    init_sigma = 0.1,
+    max_sigma = 0.5,
+    normalizer_scale = 3,
+    latent_dim = 32,
+    normalize_latent = True,
+    normalize_value = False
 )
 
 discriminators = {}

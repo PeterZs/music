@@ -32,5 +32,11 @@ TODO:
 
 - [x] code fot single-hand muscle-driven motion tracking, pretrained tracking policies
 
+    - We provide pretrained models in `pretrained/muscle_tracking`. To visualize the performance, please run
+    
+            # Evaluation
+            python main.py cfg/muscle_tracking_left.py --ckpt pretrained/muscle_tracking/muscle_tracking_left --test 
+            python main.py cfg/muscle_tracking_right.py --ckpt pretrained/muscle_tracking/muscle_tracking_right --test 
+
 - [ ] code for muscle-driven control
 - [ ] more pretrained models
