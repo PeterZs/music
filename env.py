@@ -2350,3 +2350,434 @@ class PianoJointPD(PianoBase):
         if type(actions) == tuple: actions = torch.cat(actions, -1)
         return super().process_actions(actions)
 
+
+from utils import quat2axang
+class MuscleTracking(ICCGANHumanoid):
+    GOAL_REWARD_WEIGHT = 1
+    OB_HORIZON = 1
+
+    def __init__(self, *args, **kwargs):
+        self.random_init = kwargs.get("random_init", False)
+        self.control_freq = kwargs.get("control_freq", 8)
+        self.future_horizon = kwargs.get("future_horizon", 4)
+
+        self.terminate_with_control_freq = kwargs.get("terminate_with_control_freq", False)
+
+        kwargs["ob_horizon"] = 1
+
+        self.key_link_weights_orient = kwargs["key_link_weights_orient"]
+        self.key_link_weights_pos = kwargs["key_link_weights_pos"]
+        assert all([_ >= 0 for _ in self.key_link_weights_orient.values()])
+        assert all([_ >= 0 for _ in self.key_link_weights_pos.values()])
+
+        class DummyRefMotion():
+            def __init__(self, env):
+                self.env = env
+            def state(self, motion_ids, motion_times, with_joint_tensor=False):
+                if with_joint_tensor:
+                    q = jax2torch(self.env.mjx_data.qpos)[:, 7:]
+                    return self.env.link_tensor[:,:self.env.n_char_links if self.env.has_piano else None], (q, q)
+                else:
+                    return self.env.link_tensor[:,:self.env.n_char_links if self.env.has_piano else None]
+        self.ref_motion = DummyRefMotion(self)
+
+
+        self.importance_sampling = False
+        super().__init__(*args, **kwargs)
+
+        # How many sampling episodes on average each environment will handle
+        # The whole dataset will be roughly splited into N_envs-by-N_importance_sampling chunks at most.
+        # When N_importance_sampling = 0, the wholde dataset will not splited, i.e. N_chunks == N_frames.
+        # The more chunks there are, the more sampling steps are needed to update the (performance) importance w.r.t each chunk.
+        # The training epochs that are neeeded to update the performance of all chunks:
+        #       N_chunks/N_envs * (episode_length/rollout_length)
+        # where int(N_chunks/N_envs) ~= N_importance_sampling
+        importance_sampling = kwargs.get("importance_sampling", -1)
+        self.importance_discount = kwargs.get("importance_discount", 0.99)
+        self.importance_scale = kwargs.get("importance_scale", 6)
+        self.importance_decay = kwargs.get("importance_decay", 0.5)
+        self.importance_sampling = importance_sampling > -1
+        if self.importance_sampling:
+            n_clips = self.ref_motion.motion_tensor_offset.size(0)
+            n_ref_frames = self.ref_motion.motion_link_pos_tensor.size(0)
+
+            if importance_sampling:
+                tail = int(np.ceil(n_ref_frames / (self.n_envs*importance_sampling+n_clips)))
+            else:
+                tail = 0
+            samples_ = []
+            for start, dt, length in zip(self.ref_motion.motion_tensor_offset, self.ref_motion.motion_dt_tensor, self.ref_motion.motion_n_frames_tensor):
+                n = max(1, length.item()-max(tail, int((0.5/dt).item())))
+                samples_.append((start.item(), start.item()+n))
+
+            tot = sum(e-s for s, e in samples_)
+            if importance_sampling:
+                gap = max(1, tot//(self.n_envs*importance_sampling))
+            else:
+                gap = 1
+            self.sampling_gap = int(gap)
+
+            samples = [np.arange(s, e, self.sampling_gap) for s, e in samples_]
+            tail = []
+            for b, (s, e) in zip(samples, samples_):
+                if e-b[-1] > self.sampling_gap/2:
+                    tail.append(e)
+            samples.append(tail)
+            samples = np.concatenate(samples)
+            samples = np.sort(samples)
+            print(samples, samples.shape, np.max(samples[1:]-samples[:-1]), self.sampling_gap, n_ref_frames-samples[-1])
+
+            self.tracking_motion_samples = torch.tensor(samples, device=self.device, dtype=torch.int64)
+
+            self.average_reward = 0.1*torch.ones(self.tracking_motion_samples.shape, dtype=torch.float, device=self.device)
+            print("SAMPLE", self.average_reward.size(0), self.sampling_gap)
+
+            self.cumulative_reward = torch.empty((self.n_envs,), dtype=torch.float, device=self.device)
+            self.cumulative_reward_discount = torch.empty((self.n_envs,), dtype=torch.float, device=self.device)
+            self.sampling_idx = torch.empty((self.n_envs,), dtype=torch.long, device=self.device)
+
+            self.cumulative_reward_buffer = torch.empty_like(self.average_reward)
+            self.ref_motion.motion_tensor_id = torch.empty((n_ref_frames, ), dtype=torch.int, device=self.device)
+            for idx, offset in enumerate(self.ref_motion.motion_tensor_offset):
+                self.ref_motion.motion_tensor_id[offset:] = idx
+
+            max_steps = (self.episode_length+1)//self.control_freq
+            boostrap_reward = np.flip(np.cumsum(np.flip([self.importance_discount**i for i in range(max_steps)]+[0])))
+            self.boostrap_reward = torch.tensor(np.repeat(boostrap_reward, self.control_freq), dtype=torch.float, device=self.device)
+            self.max_rew = self.boostrap_reward[0].item()
+
+    def get_goal_dim(self):
+        return self.n_char_links*7*self.future_horizon
+
+    def prepare_sim(self, opt={}):
+        opt["disableflags"] = 1<<6 + 1<<8 # no gravity, no warmstart
+        opt["gravity"] = [0, 0, 0]
+        super().prepare_sim(opt)
+        self.tracking_motion_ids = torch.zeros((self.n_envs), dtype=torch.int, device=self.device)
+        self.tracking_motion_times = torch.zeros((self.n_envs), dtype=torch.float, device=self.device)
+        self.tracking_motion_length = torch.zeros((self.n_envs), dtype=torch.long, device=self.device)
+
+        self.up_dir_tensor = torch.zeros((self.n_envs, 1, 3), dtype=torch.float, device=self.device)
+        self.up_dir_tensor[..., 2] = 1
+
+        self.arange_tensor_n_envs = torch.arange(self.n_envs, device=self.device)
+        self.origin = torch.empty((self.n_envs, 1, 3), dtype=torch.float, device=self.device)
+        self.orient = torch.empty((self.n_envs, 1, 4), dtype=torch.float, device=self.device)
+           
+        self.has_piano = any("P:" in self.mj_model.body(i).name for i in range(self.mj_model.nbody))
+        if self.has_piano:
+            self.n_char_links = min(i for i in range(self.mj_model.nbody) if "P:" in self.mj_model.body(i).name) - 1 # exclude world body
+        else:
+            self.n_char_links = self.mj_model.nbody - 1
+
+        ww = np.zeros(self.n_char_links)
+        if self.key_link_weights_orient:
+            for link, w in self.key_link_weights_orient.items():
+                lid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, link)-1 # exclude world body
+                assert lid > -1, "Unrecognized link {}".format(link)
+                ww[lid] = w
+            ww /= np.sum(ww)
+        self.key_link_weights_orient = torch.tensor(np.nan_to_num(ww), dtype=torch.float, device=self.device)
+        ww = np.zeros(self.n_char_links)
+        if self.key_link_weights_pos:
+            for link, w in self.key_link_weights_pos.items():
+                lid = mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_BODY, link)-1 # exclude world body
+                assert lid > -1, "Unrecognized link {}".format(link)
+                ww[lid] = w
+            ww /= np.sum(ww)
+        self.key_link_weights_pos = torch.tensor(np.nan_to_num(ww), dtype=torch.float, device=self.device)
+        if self.future_horizon > 1:
+            self.tracking_target = torch.empty((self.n_envs, self.future_horizon, self.n_char_links, 13), dtype=torch.float, device=self.device)
+
+        self.record = []
+
+    def init_state(self, env_ids):
+        if self.training and self.importance_sampling:
+            if self.simulation_step > 0:
+                sid = self.sampling_idx[env_ids]
+                idx, cnts = torch.unique(sid, return_counts=True)
+                self.cumulative_reward[env_ids] += (~self.info["terminate"][env_ids])*self.boostrap_reward[self.lifetime[env_ids]]
+                self.cumulative_reward_buffer.index_fill_(0, idx, 0)
+                self.cumulative_reward_buffer.index_put_((sid,), self.cumulative_reward[env_ids], accumulate=True)
+                self.average_reward[idx] *= 1-self.importance_decay
+                self.average_reward[idx] += (self.cumulative_reward_buffer[idx]/cnts).mul_(self.importance_decay)
+
+            weights = self.max_rew/self.average_reward
+            weights.pow_(self.importance_scale)
+            weights.clip_(min=1e-6, max=1e20).nan_to_num_(neginf=None, posinf=1e20, nan=None)
+
+            sid = torch.multinomial(weights, len(env_ids), replacement=True) # N_envs
+            frac = torch.from_numpy(np.random.uniform(low=0.0, high=1.0, size=(len(env_ids),))).to(device=self.device, dtype=torch.float)
+
+            if self.sampling_gap > 1:
+                sample = self.tracking_motion_samples[sid] + self.sampling_gap*frac
+                fid = sample.to(torch.int64)
+                frac = sample - fid
+            else:
+                fid = self.tracking_motion_samples[sid]
+                
+            self.sampling_idx[env_ids] = sid.to(torch.long)
+            self.cumulative_reward.index_fill_(0, env_ids, 0)
+            self.cumulative_reward_discount.index_fill_(0, env_ids, 1)
+
+            motion_ids = self.ref_motion.motion_tensor_id[fid]
+            motion_times = ((fid - self.ref_motion.motion_tensor_offset[motion_ids])+frac)*self.ref_motion.motion_dt_tensor[motion_ids]
+            self.tracking_motion_ids[env_ids] = motion_ids
+            self.tracking_motion_times[env_ids] = motion_times
+            if self.control_freq > 1 and self.terminate_with_control_freq:
+                self.tracking_motion_length[env_ids] = (((self.ref_motion.motion_length_tensor[motion_ids]-motion_times) // (self.step_time*self.control_freq))*self.control_freq).to(torch.long)
+            else:
+                self.tracking_motion_length[env_ids] = ((self.ref_motion.motion_length_tensor[motion_ids]-motion_times) // self.step_time).to(torch.long)
+        else:
+            motion_ids, motion_times = self.ref_motion.sample(len(env_ids), truncate_time=0.5)
+            if not self.random_init:
+                motion_times[:] = 0
+            if not self.training:
+                motion_times[:] = 0
+
+            self.tracking_motion_ids[env_ids] = torch.tensor(motion_ids, dtype=torch.int, device=self.device)
+            self.tracking_motion_times[env_ids] = torch.tensor(motion_times, dtype=torch.float, device=self.device)
+            if self.control_freq > 1 and self.terminate_with_control_freq:
+                self.tracking_motion_length[env_ids] = torch.tensor(((self.ref_motion.motion_length[motion_ids]-motion_times) // (self.step_time*self.control_freq))*self.control_freq,
+                                                                    dtype=torch.long, device=self.device)
+            else:
+                self.tracking_motion_length[env_ids] = torch.tensor((self.ref_motion.motion_length[motion_ids]-motion_times) // self.step_time,
+                                                                    dtype=torch.long, device=self.device)
+
+        ref_link_tensor, ref_joint_tensor = \
+            self.ref_motion.state(motion_ids, motion_times, with_joint_tensor=True)
+        
+        if self.future_horizon > 1:
+            self.update_tracking_target(env_ids, n=self.future_horizon-1)
+        return ref_link_tensor, ref_joint_tensor
+    
+    def update_tracking_target(self, env_ids, n=1):
+        dt = self.step_time*self.control_freq
+        if env_ids is None or len(env_ids) == self.n_envs:
+            if n > 1:
+                for i in range(n):
+                    self.tracking_motion_times += dt
+                    target_link_tensor = \
+                        self.ref_motion.state(self.tracking_motion_ids, self.tracking_motion_times, with_joint_tensor=False)
+                    self.tracking_target[:, i-n] = target_link_tensor
+            else:
+                self.tracking_motion_times += dt
+                target_link_tensor = \
+                    self.ref_motion.state(self.tracking_motion_ids, self.tracking_motion_times, with_joint_tensor=False)
+                if self.future_horizon > 1:
+                    self.tracking_target[:, :-1] = self.tracking_target[:, 1:].clone()
+                    self.tracking_target[:, -1] = target_link_tensor
+                else:
+                    self.tracking_target = target_link_tensor.unsqueeze_(1)
+        else:
+            env_ids_ = env_ids.cpu().numpy()
+            if n > 1:
+                motion_ids = self.tracking_motion_ids[env_ids_]
+                for i in range(n):
+                    self.tracking_motion_times[env_ids] += dt
+                    target_link_tensor = \
+                        self.ref_motion.state(motion_ids, self.tracking_motion_times[env_ids], with_joint_tensor=False)
+                    self.tracking_target[env_ids, i-n] = target_link_tensor
+            else:
+                self.tracking_motion_times[env_ids] += dt
+                target_link_tensor = \
+                    self.ref_motion.state(self.tracking_motion_ids[env_ids_], self.tracking_motion_times[env_ids_], with_joint_tensor=False)
+                if self.future_horizon > 1:
+                    self.tracking_target[env_ids, :-1] = self.tracking_target[env_ids, 1:].clone()
+                self.tracking_target[env_ids, -1] = target_link_tensor
+        
+
+    def process_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        a = actions[:,:-6]
+        self.act = torch.abs(a)
+        return torch.cat((a,
+            actions[:, -6:]*self.action_scale[-6:] + self.action_offset[-6:]), -1)
+        
+    def _observe(self, env_ids):
+        if env_ids is None:
+            n_envs = self.n_envs
+            if self.control_freq > 1:
+                counter = self.lifetime % self.control_freq
+                env_ids_ = self.arange_tensor_n_envs[counter == 0]
+                if len(env_ids_):
+                    self.update_tracking_target(env_ids_)
+                    self.origin[env_ids_] = self.link_tensor[env_ids_, :1, :3]
+                    self.orient[env_ids_] = self.link_tensor[env_ids_, :1, 3:7]
+            else:
+                self.update_tracking_target(env_ids)
+                self.origin.copy_(self.link_tensor[:, :1, :3])
+                self.orient.copy_(self.link_tensor[:, :1, 3:7])
+            target_link_tensor = self.tracking_target
+            link_tensor = self.link_tensor
+        else:
+            n_envs = len(env_ids)
+            if self.control_freq > 1:
+                counter = self.lifetime[env_ids] % self.control_freq
+                env_ids_ = env_ids[counter == 0]
+                if len(env_ids_):
+                    self.update_tracking_target(env_ids_)
+                    self.origin[env_ids_] = self.link_tensor[env_ids_, :1, :3]
+                    self.orient[env_ids_] = self.link_tensor[env_ids_, :1, 3:7]
+            else:
+                self.update_tracking_target(env_ids)
+                self.origin[env_ids] = self.link_tensor[env_ids, :1, :3]
+                self.orient[env_ids] = self.link_tensor[env_ids, :1, 3:7]
+
+            target_link_tensor = self.tracking_target[env_ids]
+            link_tensor = self.link_tensor[env_ids]
+            env_ids_ = env_ids.cpu().numpy() 
+
+        if env_ids is None:
+            origin = self.origin
+            orient = self.orient
+        else:
+            origin = self.origin[env_ids]
+            orient = self.orient[env_ids]
+
+        d = self.mjx_data
+        
+        orient_inv = quatconj(orient)
+        target_link_tensor = target_link_tensor.view(n_envs, -1, target_link_tensor.size(-1))
+        p_ = rotatepoint(orient_inv, target_link_tensor[:,:,:3]-origin).view(n_envs, -1)
+        q_ = quatmultiply(orient_inv, target_link_tensor[:,:,3:7]).view(n_envs, -1)
+
+        p = rotatepoint(orient_inv, link_tensor[:,:(self.n_char_links if self.has_piano else None),:3]-origin).view(n_envs, -1)
+        q = quatmultiply(orient_inv, link_tensor[:,:(self.n_char_links if self.has_piano else None),3:7]).view(n_envs, -1)
+        v1 = rotatepoint(orient_inv, link_tensor[:,:(self.n_char_links if self.has_piano else None),7:10]).view(n_envs, -1)
+        v2 = rotatepoint(orient_inv, link_tensor[:,:(self.n_char_links if self.has_piano else None),10:13]).view(n_envs, -1)
+
+        obs = [p, q, v1, v2]
+
+        act = jax2torch(d.act if env_ids is None else d.act[env_ids_], device=self.device)
+        obs.append(act)
+        ten_length = jax2torch(d.ten_length if env_ids is None else d.ten_length[env_ids_], device=self.device)
+        obs.append(ten_length)
+        ten_velocity = jax2torch(d.ten_velocity if env_ids is None else d.ten_velocity[env_ids_], device=self.device)
+        obs.append(ten_velocity)
+        
+        if self.control_freq > 1:
+            obs.append(counter.unsqueeze_(-1))
+        
+        obs.append(p_)
+        obs.append(q_)
+        ob = torch.cat(obs, -1)
+        return ob
+
+    def reward(self):
+        target_orient = self.tracking_target[:, 0, :, 3:7]
+        target_pos = self.tracking_target[:, 0, :, :3]
+        link_orient = self.link_tensor[:, :(self.n_char_links if self.has_piano else None), 3:7]
+        link_pos = self.link_tensor[:, :(self.n_char_links if self.has_piano else None), :3]
+        _, e_a = quat2axang(quatmultiply(link_orient, quatconj(target_orient)))
+        e_p = (link_pos - target_pos).square_().sum(-1)
+
+        eo = (e_a.square_() * self.key_link_weights_orient).sum(-1)
+        ep = (e_p.sqrt_() * self.key_link_weights_pos).sum(-1)
+        ro = eo.mul(-3).exp_()
+        rp = ep.mul(-50).exp_().mul_(0.7).add_(ep.mul(-3).exp_(), alpha=0.3)
+        rew = 0.5 * ro + 0.5 * rp
+        self.tracking_error = e_p
+
+        if self.simulation_step > 0:
+            a = torch.pow(self.act.abs(), 4).mean(-1)
+            rew *= 0.9
+            rew += 0.1*torch.exp(-a)
+
+        if self.training:
+            tracking_error = self.tracking_error[self.lifetime%self.control_freq == 0]
+            self.info["log"]["wrist"] = tracking_error[:, 2]
+            self.info["log"]["thumb_tip"] = tracking_error[:, 11]
+            self.info["log"]["index_tip"] = tracking_error[:, 18]
+            self.info["log"]["middle_tip"] = tracking_error[:, 23]
+            self.info["log"]["ring_tip"] = tracking_error[:, 28]
+            self.info["log"]["pinky_tip"] = tracking_error[:, 33]
+        
+        term = (self.lifetime>self.control_freq*4).logical_and_(torch.any(self.tracking_error > 0.5, -1))
+        if self.control_freq > 1:
+            m = self.lifetime%self.control_freq == 0
+            term.logical_and_(m)
+        if not self.terminate_with_control_freq:
+            term.logical_or_(torch.any(self.tracking_error > 1, -1))
+        self.terminate = term
+
+        if self.importance_sampling and self.simulation_step > 0:
+            if self.control_freq > 1:
+                if torch.any(m).item():
+                    self.cumulative_reward[m] += self.cumulative_reward_discount[m]*rew[m]*(~term[m])
+                    self.cumulative_reward_discount[m] *= self.importance_discount
+            else:
+                self.cumulative_reward += self.cumulative_reward_discount*rew*(~term)
+                self.cumulative_reward_discount *= self.importance_discount
+
+        return rew.unsqueeze_(-1)
+
+    def overtime_check(self):
+        over = super().overtime_check()
+        over.logical_or_(self.lifetime >= self.tracking_motion_length)
+        return over
+    
+    def termination_check(self):
+        return self.terminate
+    
+    def render(self):
+        super().render()
+
+        self.viewer.cam.azimuth = 108.125
+        self.viewer.cam.distance = 0.574599963630366
+        self.viewer.cam.elevation = -15.25
+        self.viewer.cam.lookat = [0.03719079, 0.04026999, 0.10582043]
+
+        self.tracker_link_idx = torch.nonzero(torch.logical_or(self.key_link_weights_orient>0, self.key_link_weights_pos>0)).cpu().numpy().flatten()
+        scn = self.viewer.user_scn
+        self.tracker_geom_idx = scn.ngeom
+        for _ in range(len(self.tracker_link_idx)):
+            for c in [[1, 0, 0, 1], [0, 1, 0, 1], [0, 0, 1, 1]]:
+                mujoco.mjv_initGeom(
+                    scn.geoms[scn.ngeom],
+                    type=mujoco.mjtGeom.mjGEOM_ARROW,
+                    size=[0.01, 0.01, 0.01],
+                    pos=[0, 0, 0],
+                    mat=[1, 0, 0, 0, 1, 0, 0, 0, 1],
+                    rgba=c,
+                )
+                scn.ngeom += 1
+        
+
+    def update_viewer(self):
+        if self.lifetime[0].item() % self.control_freq != 0:
+            return
+
+        super().update_viewer()
+
+        from matplotlib import colormaps
+        cm = colormaps["autumn"]
+        if self.muscle_control:
+            self.mj_model.tendon_rgba = cm(self.mj_data.act)
+        else:
+            self.mj_model.tendon_rgba = cm(self.mj_data.actuator_force[:-6]/self.mj_model.actuator_forcerange[:-6,1])
+
+        from scipy.spatial.transform import Rotation as R
+        scn = self.viewer.user_scn
+        pos = self.tracking_target[0, 0, :, :3].cpu().numpy()
+        orient = self.tracking_target[0, 0, :, 3:7].cpu().numpy()
+        for j, idx in enumerate(self.tracker_link_idx):
+            p = pos[idx]
+            o = orient[idx]
+            mat = R.from_quat(o).as_matrix()
+            for i, c in enumerate([[1, 0, 0, 1], [0, 1, 0, 1], [0, 0, 1, 1]]):
+                mujoco.mjv_initGeom(
+                    scn.geoms[self.tracker_geom_idx+i+j*3],
+                    type=mujoco.mjtGeom.mjGEOM_ARROW,
+                    size=[0.002, 0.002, 0.002],
+                    pos=p,
+                    mat=mat.flatten(),
+                    rgba=c,
+                )
+                mujoco.mjv_connector(
+                    scn.geoms[self.tracker_geom_idx+i+j*3],
+                    type=mujoco.mjtGeom.mjGEOM_ARROW,
+                    width=0.001,
+                    from_=p,
+                    to=p + 0.02*(mat*c[:-1])[:,i],
+                )
+

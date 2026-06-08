@@ -30,5 +30,7 @@ TODO:
 
         Right after the training start, it will read the reference dataset by operning all the files in the `motions` folder. In some OS, the command `ulimit -n 4096` needs to run first, to increase the number of files that can be opened by one process.
 
+- [x] code fot single-hand muscle-driven motion tracking, pretrained tracking policies
+
 - [ ] code for muscle-driven control
 - [ ] more pretrained models
