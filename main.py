@@ -81,10 +81,13 @@ def test(env, model):
     while not env.request_quit:
         obs, info = env.reset_done()
         seq_len = info["ob_seq_lens"]
-        pi1 = model1.act(obs, seq_len-1)
-        pi2 = model2.act(obs, seq_len-1)
-
-        actions = (pi1.mean, pi2.mean)
+        if hasattr(env, "two_hands") and env.two_hands:
+            pi1 = model1.act(obs, seq_len-1)
+            pi2 = model2.act(obs, seq_len-1)
+            actions = (pi1.mean, pi2.mean)
+        else:
+            pi = model.act(obs, seq_len-1)
+            actions = pi.mean
         env.step(actions)
 
 
@@ -108,14 +111,22 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
     N_ENVS = env.n_envs
     LOG = logger is not None
     SAVE_CKPT = ckpt_dir is not None
+    TWO_HANDS = hasattr(env, "two_hands") and env.two_hands
 
+    if TWO_HANDS:
+        optimizer = torch.optim.Adam([
+            {"params": list(model1.actor.parameters())+list(model2.actor.parameters()), "lr": training_params.actor_lr},
+            {"params": list(model1.critic.parameters())+list(model2.critic.parameters()), "lr": training_params.critic_lr}
+        ])
+        ac1_parameters = list(model1.actor.parameters()) + list(model1.critic.parameters())
+        ac2_parameters = list(model2.actor.parameters()) + list(model2.critic.parameters())
+    else:
+        optimizer = torch.optim.Adam([
+            {"params": list(model.actor.parameters()), "lr": training_params.actor_lr},
+            {"params": list(model.critic.parameters()), "lr": training_params.critic_lr}
+        ])
+        ac1_parameters = list(model1.actor.parameters()) + list(model1.critic.parameters())
 
-    optimizer = torch.optim.Adam([
-        {"params": list(model1.actor.parameters())+list(model2.actor.parameters()), "lr": training_params.actor_lr},
-        {"params": list(model1.critic.parameters())+list(model2.critic.parameters()), "lr": training_params.critic_lr}
-    ])
-    ac1_parameters = list(model1.actor.parameters()) + list(model1.critic.parameters())
-    ac2_parameters = list(model2.actor.parameters()) + list(model2.critic.parameters())
     disc_optimizer = {name: torch.optim.Adam(disc.parameters(), training_params.disc_lr) for name, disc in model.discriminators.items()}
 
     buffer = dict(
@@ -174,14 +185,18 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
             obs, info = env.reset_done()
             seq_len = info["ob_seq_lens"]
 
-            pi1, values1 = model1.act(obs, seq_len-1, with_value=True)
-            pi2, values2 = model2.act(obs, seq_len-1, with_value=True)
+            pi1, values1 = model.act(obs, seq_len-1, with_value=True)
             actions1 = pi1.sample()
-            actions2 = pi2.sample()
             log_probs1 = pi1.log_prob(actions1).sum(-1, keepdim=True)
-            log_probs2 = pi2.log_prob(actions2).sum(-1, keepdim=True)
+            if TWO_HANDS:
+                pi2, values2 = model2.act(obs, seq_len-1, with_value=True)
+                actions2 = pi2.sample()
+                log_probs2 = pi2.log_prob(actions2).sum(-1, keepdim=True)
+                actions = actions1, actions2
+            else:
+                actions = actions1
 
-            obs_, rews, dones, info = env.step((actions1, actions2))
+            obs_, rews, dones, info = env.step(actions)
 
             terminate = info["terminate"]
 
@@ -205,7 +220,8 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                         d[mask, -1] = 0
 
             values1_ = model1.evaluate(obs_, seq_len)
-            values2_ = model2.evaluate(obs_, seq_len)
+            if TWO_HANDS:
+                values2_ = model2.evaluate(obs_, seq_len)
 
             info_log = info["log"]
             for k, v in performance.items():
@@ -214,12 +230,13 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
         buffer["s"].append(obs)
         buffer["a1"].append(actions1)
         buffer["lp1"].append(log_probs1)
-        buffer["a2"].append(actions2)
-        buffer["lp2"].append(log_probs2)
         buffer["v1"].append(values1)
         buffer["v1_"].append(values1_)
-        buffer["v2"].append(values2)
-        buffer["v2_"].append(values2_)
+        if TWO_HANDS:
+            buffer["a2"].append(actions2)
+            buffer["lp2"].append(log_probs2)
+            buffer["v2"].append(values2)
+            buffer["v2_"].append(values2_)
         buffer["not_done"].append(not_done)
         buffer["terminate"].append(terminate)
         buffer["ob_seq_len"].append(seq_len)
@@ -344,32 +361,31 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                 returns1 = advantages1 + values1.view(-1, advantages1.size(-1))
                 sigma, mu = torch.std_mean(advantages1, dim=0, unbiased=True)
                 advantages1 = (advantages1 - mu) / (sigma + 1e-8) # (HORIZON x N_ENVS) x N_DISC
-
-
-                values2 = torch.cat(buffer["v2"])
-                values2_ = torch.cat(buffer["v2_"])
-                if model2.value_normalizer is not None:
-                    values2 = model2.value_normalizer(values2, unnorm=True)
-                    values2_ = model2.value_normalizer(values2_, unnorm=True)
-                values2_[terminate] = 0
-                values2 = values2.view(HORIZON, -1, values2.size(-1))
-                values2_ = values2_.view(HORIZON, -1, values2_.size(-1))
-
-                advantages2 = (rewards_[...,[2,3,5]] - values2).add_(values2_, alpha=GAMMA)
-                for t in reversed(range(HORIZON-1)):
-                    # advantages2[t].addcmul_(advantages2[t+1], not_done[t], value=GAMMA_LAMBDA)
-                    advantages2[t].add_(advantages2[t+1]*not_done[t], alpha=GAMMA_LAMBDA)
-                advantages2 = advantages2.view(-1, advantages2.size(-1))
-                returns2 = advantages2 + values2.view(-1, advantages2.size(-1))
-                sigma, mu = torch.std_mean(advantages2, dim=0, unbiased=True)
-                advantages2 = (advantages2 - mu) / (sigma + 1e-8) # (HORIZON x N_ENVS) x N_DISC
-
                 log_probs1 = torch.cat(buffer["lp1"])
-                log_probs2 = torch.cat(buffer["lp2"])
                 actions1 = torch.cat(buffer["a1"])
-                actions2 = torch.cat(buffer["a2"])
-                states = torch.cat(buffer["s"])
 
+                if TWO_HANDS:
+                    values2 = torch.cat(buffer["v2"])
+                    values2_ = torch.cat(buffer["v2_"])
+                    if model2.value_normalizer is not None:
+                        values2 = model2.value_normalizer(values2, unnorm=True)
+                        values2_ = model2.value_normalizer(values2_, unnorm=True)
+                    values2_[terminate] = 0
+                    values2 = values2.view(HORIZON, -1, values2.size(-1))
+                    values2_ = values2_.view(HORIZON, -1, values2_.size(-1))
+
+                    advantages2 = (rewards_[...,[2,3,5]] - values2).add_(values2_, alpha=GAMMA)
+                    for t in reversed(range(HORIZON-1)):
+                        # advantages2[t].addcmul_(advantages2[t+1], not_done[t], value=GAMMA_LAMBDA)
+                        advantages2[t].add_(advantages2[t+1]*not_done[t], alpha=GAMMA_LAMBDA)
+                    advantages2 = advantages2.view(-1, advantages2.size(-1))
+                    returns2 = advantages2 + values2.view(-1, advantages2.size(-1))
+                    sigma, mu = torch.std_mean(advantages2, dim=0, unbiased=True)
+                    advantages2 = (advantages2 - mu) / (sigma + 1e-8) # (HORIZON x N_ENVS) x N_DISC
+                    log_probs2 = torch.cat(buffer["lp2"])
+                    actions2 = torch.cat(buffer["a2"])
+
+                states = torch.cat(buffer["s"])
                 if model1.use_rnn:
                     states_raw = model1.observe(states, norm=False)[0]
                     if OB_HORIZON > 1:
@@ -380,27 +396,28 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                     model1.ob_normalizer.update(states_raw, count_scale=N_ENVS) # use count_scale to prevent normalizer converge too fast when env is large
                 else:
                     model1.ob_normalizer.update(states, count_scale=N_ENVS)
-                if model2.use_rnn:
-                    if not model1.use_rnn:
-                        states_raw = model2.observe(states, norm=False)[0]
-                        if OB_HORIZON > 1:
-                            length = torch.arange(env.ob_horizon, 
-                                dtype=ob_seq_lens.dtype, device=ob_seq_lens.device)
-                            mask = length.unsqueeze_(0) < ob_seq_lens.unsqueeze(1)
-                            states_raw = states_raw[mask]
-                    model2.ob_normalizer.update(states_raw, count_scale=N_ENVS) # use count_scale to prevent normalizer converge too fast when env is large
-                else:
-                    model2.ob_normalizer.update(states, count_scale=N_ENVS)
-
                 if model1.value_normalizer is not None:
                     model1.value_normalizer.update(returns1)
                     returns1 = model1.value_normalizer(returns1)
-                if model2.value_normalizer is not None:
-                    model2.value_normalizer.update(returns2)
-                    returns2 = model2.value_normalizer(returns2)
                 if multi_critics:
                     advantages1 = advantages1.mul_(reward_weights1)
-                    advantages2 = advantages2.mul_(reward_weights2)
+                if TWO_HANDS:
+                    if model2.use_rnn:
+                        if not model1.use_rnn:
+                            states_raw = model2.observe(states, norm=False)[0]
+                            if OB_HORIZON > 1:
+                                length = torch.arange(env.ob_horizon, 
+                                    dtype=ob_seq_lens.dtype, device=ob_seq_lens.device)
+                                mask = length.unsqueeze_(0) < ob_seq_lens.unsqueeze(1)
+                                states_raw = states_raw[mask]
+                        model2.ob_normalizer.update(states_raw, count_scale=N_ENVS) # use count_scale to prevent normalizer converge too fast when env is large
+                    else:
+                        model2.ob_normalizer.update(states, count_scale=N_ENVS)
+                    if model2.value_normalizer is not None:
+                        model2.value_normalizer.update(returns2)
+                        returns2 = model2.value_normalizer(returns2)
+                    if multi_critics:
+                        advantages2 = advantages2.mul_(reward_weights2)
 
             n_samples = states.size(0)
             policy_loss, value_loss = [], []
@@ -411,37 +428,35 @@ def train(env, model, ckpt_dir, training_params, ckpt=None):
                     sample = idx[BATCH_SIZE * batch: BATCH_SIZE *(batch+1)]
                     s = states[sample]
                     a1 = actions1[sample]
-                    a2 = actions2[sample]
                     lp1 = log_probs1[sample]
-                    lp2 = log_probs2[sample]
                     adv1 = advantages1[sample]
-                    adv2 = advantages2[sample]
                     v_t1 = returns1[sample]
-                    v_t2 = returns2[sample]
                     end_frame = ob_seq_end_frames[sample]
 
                     pi1_, v1_ = model1(s, end_frame)
-                    pi2_, v2_ = model2(s, end_frame)
-
                     lp1_ = pi1_.log_prob(a1)
-                    lp2_ = pi2_.log_prob(a2)
-
                     lp1_ = lp1_.sum(-1, keepdim=True)
-                    lp2_ = lp2_.sum(-1, keepdim=True)
-
                     ratio = torch.exp(lp1_ - lp1)
                     clipped_ratio = torch.clamp(ratio, 1.0-0.2, 1.0+0.2)
-                    pg_loss1 = -torch.min(adv1*ratio, adv1*clipped_ratio).sum(-1).mean()
-                    vf_loss1 = (v1_ - v_t1).square().mean()
-                    ratio = torch.exp(lp2_ - lp2)
-                    clipped_ratio = torch.clamp(ratio, 1.0-0.2, 1.0+0.2)
-                    pg_loss2 = -torch.min(adv2*ratio, adv2*clipped_ratio).sum(-1).mean()
-                    vf_loss2 = (v2_ - v_t2).square().mean()
+                    pg_loss = -torch.min(adv1*ratio, adv1*clipped_ratio).sum(-1).mean()
+                    vf_loss = (v1_ - v_t1).square().mean()
 
-                    pg_loss = pg_loss1 + pg_loss2
-                    vf_loss = vf_loss1 + vf_loss2
+                    if TWO_HANDS:
+                        a2 = actions2[sample]
+                        lp2 = log_probs2[sample]
+                        adv2 = advantages2[sample]
+                        v_t2 = returns2[sample]
+                        pi2_, v2_ = model2(s, end_frame)
+                        lp2_ = pi2_.log_prob(a2)
+                        lp2_ = lp2_.sum(-1, keepdim=True)
+                        ratio = torch.exp(lp2_ - lp2)
+                        clipped_ratio = torch.clamp(ratio, 1.0-0.2, 1.0+0.2)
+                        pg_loss2 = -torch.min(adv2*ratio, adv2*clipped_ratio).sum(-1).mean()
+                        vf_loss2 = (v2_ - v_t2).square().mean()
+                        pg_loss = pg_loss + pg_loss2
+                        vf_loss = vf_loss + vf_loss2
+
                     loss = pg_loss + 0.5*vf_loss
-                    
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(ac1_parameters, 1.0)
                     torch.nn.utils.clip_grad_norm_(ac2_parameters, 1.0)
@@ -584,10 +599,12 @@ if __name__ == "__main__":
     value_dim = len(env.discriminators)+env.rew_dim
     state_dim, goal_dim = env.state_dim, env.goal_dim
     
-    assert env.multi_objective_reward
-    model1 = ACModel(use_rnn, state_dim, env.act_dim//2, goal_dim, value_dim//2, **config.model_params)
-    model2 = ACModel(use_rnn, state_dim, env.act_dim//2, goal_dim, value_dim//2, **config.model_params)
-    model = torch.nn.ModuleList([model1, model2])
+    if hasattr(env, "two_hands") and env.two_hands:
+        model1 = ACModel(use_rnn, state_dim, env.act_dim//2, goal_dim, value_dim//2, **config.model_params)
+        model2 = ACModel(use_rnn, state_dim, env.act_dim//2, goal_dim, value_dim//2, **config.model_params)
+        model = torch.nn.ModuleList([model1, model2])
+    else:
+        model = ACModel(use_rnn, state_dim, env.act_dim, goal_dim, value_dim, **config.model_params)
 
     discriminators = torch.nn.ModuleDict({
         name: Discriminator(dim) for name, dim in env.disc_dim.items()
