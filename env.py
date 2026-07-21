@@ -2781,3 +2781,218 @@ class MuscleTracking(ICCGANHumanoid):
                     to=p + 0.02*(mat*c[:-1])[:,i],
                 )
 
+
+class PianoMuscleDriven(PianoBase):
+
+    def __init__(self, *args, **kwargs):
+        self.controller_steps =  kwargs["control_freq"]
+        kwargs["episode_length"] = kwargs["episode_length"]//(kwargs["frameskip"]*kwargs["control_freq"])
+        kwargs["frameskip"] = int(kwargs["frameskip"] * kwargs["control_freq"])
+        kwargs["fps"] = kwargs["fps"] / self.controller_steps
+        super().__init__(*args, **kwargs)
+        self.frameskip //= self.controller_steps
+
+        control_policy = kwargs.get("control_policy")
+        if self.two_hands:
+            assert len(control_policy) == 2
+            controller1, act_dim1 = self.load_controller(control_policy[0])
+            controller2, act_dim2 = self.load_controller(control_policy[1])
+            assert controller1.future_goal_horizon == controller2.future_goal_horizon
+            self.controller = torch.nn.ModuleList([controller1, controller2])
+            self.controller.future_goal_horizon = controller1.future_goal_horizon
+            self.act_dim = act_dim1 + act_dim2
+        else:
+            if type(control_policy) == list or type(control_policy) == tuple:
+                control_policy = control_policy[0]
+            self.controller, self.act_dim = self.load_controller(control_policy)
+        self.controller.to(self.device)
+        self.controller.eval()
+
+    def process_actions(self, actions: torch.Tensor) -> torch.Tensor:
+        return actions
+
+    def do_simulation(self, actions):
+        model = self.mjx_model
+        if self.two_hands:
+            if type(actions) == tuple:
+                actions1, actions2 = actions
+            else:
+                act_dim_by_2 = actions.size(-1)//2
+                actions1 = actions[:, :act_dim_by_2]
+                actions2 = actions[:, act_dim_by_2:]
+            controller1 = self.controller[0]
+            controller2 = self.controller[1]
+        else:
+            controller = self.controller
+
+        for substep in range(self.controller_steps):
+            if substep > 0:
+                self.refresh_tensors()
+
+            if self.two_hands:
+                s = self.controller_observe(substep)
+                a1 = controller1(s[0], actions1)
+                a2 = controller2(s[1], actions2)
+                a = torch.cat((a1, a2), -1)
+                a.mul_(self.action_scale).add_(self.action_offset)
+            else:
+                s = self.controller_observe(substep)
+                a = controller(s, actions)
+                a.mul_(self.action_scale).add_(self.action_offset)
+            ctrl = torch2jax(a, device=self.jax_device)
+            data = self.mjx_data.replace(ctrl=ctrl)
+            for _ in range(self.frameskip):
+                data = self.mjx_step1(model, data)
+
+            self.mjx_data = data
+
+        self.simulation_step += 1
+
+
+    def load_controller(self, control_policy):
+        from models import ACModel, RunningMeanStd
+        ckpt = torch.load(control_policy, map_location="cpu", weights_only=False)["model"]
+        print("load control policy from", control_policy)
+        use_rnn = any("rnn" in _ for _ in ckpt.keys())
+        if use_rnn: raise NotImplementedError()
+
+        latent_dim = int(ckpt["actor.embed_goal.4.bias"].shape[0])
+        state_dim = int(ckpt["actor.mlp.0.weight"].shape[1]) - latent_dim
+        act_dim = int(ckpt["actor.mu.bias"].shape[0])
+        actor_goal_dim = int(ckpt["actor.embed_goal.0.weight"].shape[1])
+        # critic_goal_dim = int(ckpt["critic.mlp.0.weight"].shape[1])-state_dim
+        # assert actor_goal_dim == critic_goal_dim
+
+        # tracking controller
+        class Controller(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.actor = ACModel.Actor(use_rnn, state_dim+latent_dim, act_dim, goal_dim=0, max_sigma=0.5, normalize_latent=True)
+                self.actor.load_state_dict({k[len("actor."):]:v for k, v in ckpt.items() if "actor." in k and "goal" not in k})
+                self.normalizer = RunningMeanStd(state_dim, scale=3)
+                self.normalizer.mean.copy_(ckpt["ob_normalizer.mean"][:state_dim])
+                self.normalizer.var.copy_(ckpt["ob_normalizer.var"][:state_dim])
+            @torch.no_grad
+            def forward(self, s, z, x=None):
+                if x is None:
+                    h = z
+                elif z is None:
+                    h = x
+                else:
+                    h = x + z
+                h = h/h.norm(p=2,dim=-1,keepdim=True)
+                s = self.normalizer(s)
+                s = s.view(s.size(0), -1)
+                h.nan_to_num_(nan=(1/h.size(-1))**0.5)
+                pi = self.actor(torch.cat((s, h), -1))
+                return pi.mean
+
+        controller = Controller()
+
+        embed_goal = torch.nn.Sequential(
+            torch.nn.Linear(actor_goal_dim, 1024),
+            torch.nn.ReLU(),
+            torch.nn.Linear(1024, 1024),
+            torch.nn.ReLU(),
+            torch.nn.Linear(1024, latent_dim)
+        )
+        embed_goal.load_state_dict({k[len("actor.embed_goal."):]:v for k, v in ckpt.items() if "actor.embed_goal." in k})
+        goal_normalizer = RunningMeanStd(actor_goal_dim, scale=3)
+        goal_normalizer.mean.copy_(ckpt["ob_normalizer.mean"][state_dim:])
+        goal_normalizer.var.copy_(ckpt["ob_normalizer.var"][state_dim:])
+
+        act_dim = latent_dim
+        class EmbedGoal(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_goal = embed_goal
+                self.goal_normalizer = goal_normalizer
+            def forward(self, g):
+                h = self.embed_goal(self.goal_normalizer(g))
+                h = h/h.norm(p=2,dim=-1,keepdim=True)
+                return h.nan_to_num_(nan=(1/h.size(-1))**0.5)
+        controller.embed_goal = EmbedGoal()
+
+        if self.two_hands:
+            controller.future_goal_horizon = goal_normalizer.mean.size(0)//(self.n_char_links//2*7)
+        else:
+            controller.future_goal_horizon = goal_normalizer.mean.size(0)//(self.n_char_links*7)
+        return controller, act_dim
+
+    def controller_observe(self, counter):
+        n_envs = self.n_envs
+        link_tensor = self.link_tensor
+
+        if self.two_hands:
+            idx2 = self.n_char_links//2
+            if torch.is_tensor(counter):
+                m = counter == 0
+                self.origin2[m] = link_tensor[m, [0,idx2], None, :3]
+                self.orient_inv2[m] = quatconj(link_tensor[m, [0,idx2], None, 3:7])
+            elif counter == 0:
+                self.origin2 = link_tensor[:, [0,idx2], None, :3]
+                self.orient_inv2 = quatconj(link_tensor[:, [0,idx2], None, 3:7])
+            origin = self.origin2
+            orient_inv = self.orient_inv2
+        else:
+            # All substeps for muscle control share the same origin
+            if torch.is_tensor(counter):
+                m = counter == 0
+                self.origin[m] = link_tensor[m, :1, :3]
+                self.orient_inv[m] = quatconj(link_tensor[m, :1, 3:7])
+            elif counter == 0:
+                self.origin = link_tensor[:, :1, :3]
+                self.orient_inv = quatconj(link_tensor[:, :1, 3:7])
+            origin = self.origin
+            orient_inv = self.orient_inv
+
+        if torch.is_tensor(counter):
+            counter = counter.view(n_envs, 1)
+        else:
+            counter = torch.full((n_envs,1), counter, dtype=torch.float, device=self.device)
+
+        n_char_links = self.n_char_links
+        d = self.mjx_data
+        act = jax2torch(d.act, device=self.device)
+        ten_length = jax2torch(d.ten_length, device=self.device)
+        ten_velocity = jax2torch(d.ten_velocity, device=self.device)
+
+        if self.two_hands:
+            act = act.view(n_envs, 2, -1)
+            ten_length = ten_length.view(n_envs, 2, -1)
+            ten_velocity = ten_velocity.view(n_envs, 2, -1)
+            p = link_tensor[:,:(n_char_links if self.has_piano else None),:3]
+            q = link_tensor[:,:(n_char_links if self.has_piano else None),3:7]
+            v1 = link_tensor[:,:(n_char_links if self.has_piano else None),7:10]
+            v2 = link_tensor[:,:(n_char_links if self.has_piano else None),10:13]
+            p = rotatepoint(orient_inv, p.view(n_envs, 2, -1, 3) - origin).view(n_envs, 2, -1)
+            q = quatmultiply(orient_inv, q.view(n_envs, 2, -1, 4)).view(n_envs, 2, -1)
+            v1 = rotatepoint(orient_inv, v1.view(n_envs, 2, -1, 3)).view(n_envs, 2, -1)
+            v2 = rotatepoint(orient_inv, v2.view(n_envs, 2, -1, 3)).view(n_envs, 2, -1)
+            obs1 = [p[:, 0], q[:, 0], v1[:, 0], v2[:, 0]]
+            obs2 = [p[:, 1], q[:, 1], v1[:, 1], v2[:, 1]]
+            obs1.append(act[:, 0])
+            obs1.append(ten_length[:, 0])
+            obs1.append(ten_velocity[:, 0])
+            obs2.append(act[:, 1])
+            obs2.append(ten_length[:, 1])
+            obs2.append(ten_velocity[:, 1])
+            obs1.append(counter)
+            obs2.append(counter)
+            obs1 = torch.cat(obs1, -1)
+            obs2 = torch.cat(obs2, -1)
+            s = obs1, obs2
+        else:
+            n_char_links = 34
+            p = rotatepoint(orient_inv, link_tensor[:,:(n_char_links if self.has_piano else None),:3]-origin).view(n_envs, -1)
+            q = quatmultiply(orient_inv, link_tensor[:,:(n_char_links if self.has_piano else None),3:7]).view(n_envs, -1)
+            v1 = rotatepoint(orient_inv, link_tensor[:,:(n_char_links if self.has_piano else None),7:10]).view(n_envs, -1)
+            v2 = rotatepoint(orient_inv, link_tensor[:,:(n_char_links if self.has_piano else None),10:13]).view(n_envs, -1)
+            obs = [p, q, v1, v2]
+            obs.append(act)
+            obs.append(ten_length)
+            obs.append(ten_velocity)
+            obs.append(counter)
+            s = torch.cat(obs, -1)
+
+        return s
