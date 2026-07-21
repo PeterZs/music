@@ -1,0 +1,23 @@
+[project]
+name = "music"
+version = "1.0.0"
+description = "Learning muscle-driven dexterous hand control."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "jax[cuda12]==0.4.34; sys_platform == 'linux'",
+    "jax==0.4.34; sys_platform != 'linux'",
+    "joblib>=1.4",
+    "matplotlib>=3.10",
+    "mujoco==3.3.5",
+    "mujoco-mjx==3.3.5",
+    "numpy>=2.0",
+    "pyyaml>=6.0",
+    "scipy>=1.15",
+    "sounddevice>=0.5",
+    "tensorboard>=2.20",
+    "torch==2.6.0",
+]
+
+[tool.uv]
+package = false
